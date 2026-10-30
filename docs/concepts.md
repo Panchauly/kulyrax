@@ -205,6 +205,10 @@ the adapter, before anything is written; `dry-run` never creates it), or the
 are Kulyrax's own bookkeeping, safe to inspect, unsafe to hand-edit — treat
 them the way you'd treat a database's own internal indexes.
 
+For the file-backed stores, `.conduit/` also holds the batch logs (`wal/`) and
+the single-writer lock (`lock`) that make them crash-safe; see
+[`file-store-durability.md`](file-store-durability.md).
+
 ## Next
 
 - [`docs/mapping-reference.md`](mapping-reference.md) — every mapping field,

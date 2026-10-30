@@ -482,7 +482,7 @@ fn render_source_run_report(
 
 fn render_stage_timings(t: &StageTimings) {
     println!(
-        "Time per stage (dispatch contains adapter and batch, which contain read/write/commit; schema runs once, before ingesting):"
+        "Time per stage (dispatch contains adapter and batch, which contain read/write/commit/log/apply; schema runs once, before ingesting; sync runs in the background):"
     );
     for (name, s) in [
         ("source read", t.source_read),
@@ -494,6 +494,9 @@ fn render_stage_timings(t: &StageTimings) {
         ("write", t.write),
         ("commit", t.commit),
         ("checkpoint", t.checkpoint),
+        ("log", t.log),
+        ("apply", t.apply),
+        ("sync", t.sync),
     ] {
         if s.calls == 0 {
             continue;
@@ -506,10 +509,14 @@ fn render_stage_timings(t: &StageTimings) {
         );
     }
     if t.adapter.calls > 0 {
-        let inner = t.read.total_us + t.write.total_us + t.commit.total_us;
+        let inner = t.read.total_us
+            + t.write.total_us
+            + t.commit.total_us
+            + t.log.total_us
+            + t.apply.total_us;
         let other = (t.adapter.total_us + t.batch.total_us).saturating_sub(inner);
         println!(
-            "  adapter and batch time outside read/write/commit (mapping, connection, begin): {:.1} ms, {:.1} µs/event",
+            "  adapter and batch time outside read/write/commit/log/apply (mapping, connection, begin): {:.1} ms, {:.1} µs/event",
             other as f64 / 1000.0,
             other as f64 / t.adapter.calls as f64
         );

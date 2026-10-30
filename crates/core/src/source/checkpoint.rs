@@ -3,6 +3,7 @@
 //! Structurally the same idea as the projection guard, kept deliberately
 //! separate (input-side vs output-side state).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -35,8 +36,11 @@ pub fn read_checkpoint(
     }
 }
 
-/// Write a source's checkpoint via write-to-temp-then-rename, so a reader can
-/// never observe a half-written file.
+/// Write a source's checkpoint durably: temp file, fsync, rename, fsync the
+/// directory. A reader never observes a half-written file, and once this
+/// returns the position survives a power loss. Adapters make their batch
+/// durable before the runner calls this, so the checkpoint is never durable
+/// ahead of the projections it covers.
 pub fn write_checkpoint(
     state_dir: &Path,
     source_id: &str,
@@ -51,9 +55,28 @@ pub fn write_checkpoint(
     let tmp = state_dir.join(format!(".{source_id}.json.tmp-{}", std::process::id()));
     let body =
         serde_json::to_string_pretty(&cp).map_err(|e| SourceError::Checkpoint(e.to_string()))?;
-    std::fs::write(&tmp, body)?;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, &path)?;
+    sync_dir(state_dir)?;
     Ok(())
+}
+
+/// Fsync a directory so a rename in it is durable. Windows cannot open a
+/// directory as a file; NTFS journals the rename instead, so this is a no-op
+/// there.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 fn now_string() -> String {

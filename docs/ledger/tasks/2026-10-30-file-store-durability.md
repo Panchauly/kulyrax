@@ -1,0 +1,116 @@
+---
+status: in-progress
+---
+
+# Phase 3: crash-safe, batched file stores
+
+## Objective
+
+Make the three file-backed stores (document, key-value, graph) crash-safe and
+batched, per the owner's Phase 3 brief (2026-10-30, deadline 1 Nov): a per-batch
+write-ahead log, a single writer per store, crash tests, benchmarks, docs and release
+notes for v0.11.0. Design:
+[2026-10-30-file-store-batch-log](../decisions/2026-10-30-file-store-batch-log.md).
+Cutoff: if the crash tests aren't green by the end of 31 Oct, ship the file stores
+labelled "development use, not crash-safe" instead.
+
+Step 0 (done 2026-10-30): Postgres lag at 5,000/s passed (p99 877 ms,
+[2026-10-28-batch-transactions](2026-10-28-batch-transactions.md)), so v0.10.0 was
+merged to `main` as PR #11 (`8b25195`, all 10 checks green, owner-approved), and
+`phase-3` was branched from it. `v0.10.0` is not tagged yet: a tag publishes release
+binaries.
+
+## Acceptance criteria
+
+- [x] Per batch: `decide()` per event in memory, guards cached in memory for the
+  store, each key collapsed to its final state.
+- [x] The whole batch (data + guards) is written to one batch log, fsynced once, and
+  renamed into place. The directory is fsynced, a no-op on Windows (documented).
+- [x] The batch is applied to the per-key files without fsync.
+- [x] The checkpoint is written temp → fsync → rename (+ directory fsync).
+- [x] Logs are kept until a sync point (32 batches or 1 s). The sync point fsyncs
+  each touched file once, then deletes the logs it covers, oldest first.
+- [x] Recovery at start-up replays every log not covered by a sync point, before
+  ingesting. Replay is idempotent (full-state writes).
+- [x] Invariant: the checkpoint is never durable ahead of the batch log (the log is
+  fsynced inside `commit_batch`, and the runner writes the checkpoint after it).
+- [x] Single writer: an exclusive OS lock on `.conduit/lock` at `prepare()`. A second
+  process fails fast with a clear error (tested in process and across processes).
+- [x] Fault injection after the log write, mid-apply, before the checkpoint, before
+  the sync point (plus mid-sync). Each restart equals the reference run: no
+  duplicates, no missing keys.
+- [x] Kill loop: child process killed at random points, 20 iterations, verified
+  each time.
+- [x] Torn/partial batch log detected (length + checksum) and discarded. Its events
+  replay from the checkpoint.
+- [ ] Benchmarks: 100k per file store, Defender excluded, batch 5,000, target
+  ≥ 2,000 events/s on this laptop, per-stage numbers. Lag reruns at 1,000/s.
+- [x] Docs: file-store durability model (`docs/file-store-durability.md`).
+- [ ] Release notes for v0.11.0 (drafted, `RELEASES/v0.11.0.md`; benchmark numbers
+  pending).
+- [ ] Gates green before every push.
+
+## Constraints and assumptions
+
+- `decide()`, `dispatch.rs` and the dependency graph are unchanged, with no
+  storage-kind special case. The three backends' `exec::project*` are unchanged; only
+  their file drivers now go through `adapter/file_store.rs`.
+- No tokio in core: the sync point runs on one `std::thread` per store root.
+- Zero-panic rule: the crash hook calls `std::process::abort()`, but only behind the
+  `crash-points` feature, which only `kulyrax-cli`'s dev-dependencies enable.
+- MSRV 1.88 → 1.89 for `File::try_lock` (decision record).
+- Owner's brief says "Defender excluded" for benchmarks. **The exclusion for
+  `examples\benchmark\work` was removed on 2026-10-28 at 21:22** (Defender
+  operational log, event 5007). Adding it back needs admin; the owner was notified
+  on 2026-10-30.
+
+## Decisions
+
+- [2026-10-30-file-store-batch-log](../decisions/2026-10-30-file-store-batch-log.md):
+  the batch log design, sync delay, per-root shared handle, stop-on-failure, lazy
+  prepare.
+
+## Verification
+
+Hardware as in the baselines (i5-10210U, 32 GB, LITEON NVMe, Windows 11, on AC
+power).
+
+**File-system costs** (`fsbench` microbenchmarks in the session scratchpad, 200-byte
+files, Defender exclusion not active):
+
+| Operation | Cost |
+|---|---|
+| Create a file, 1 / 4 / 16 threads | 802 / 375 / 357 µs per file (excluded dir); 538 / 254 / 247 (scratchpad) |
+| One fsync with dirty data (new or overwritten file) | ~45 ms |
+| 1 MB write + fsync | 30–80 ms |
+| Fsync 4,000 freshly written files, 1 / 8 / 32 threads | 1,216 / 584 / 1,847 µs per file |
+| The same, 2 s after writing, 1 / 8 threads | 252 / 42 µs per file |
+
+These set the sync delay (2 s) and explain the crash suite's run times.
+
+**Tests** (all observed):
+
+| Check | Command | Result |
+|---|---|---|
+| Existing core suite on the new write path | `cargo test -p kulyrax-core` | 85 binaries, 270 passed, 0 failed (before the new tests) |
+| Batch = one-at-a-time, all three stores, batch 1 / 4 / 100; rollback; failed event; clean shutdown; reopen; in-process sharing; lock | `cargo test -p kulyrax-core --test file_store_batch` | 7 passed |
+| The equivalence test can fail | Mutation: `child_dirs` ignores the open batch | graph, batch 100: an edge to a node tombstoned earlier in the batch was created (`Created` vs `Skipped(EntityAbsent)`); reverted |
+| Crash suite: after-log, mid-apply, before-checkpoint, before-sync, mid-sync, unsynced files wiped, torn newest log, corrupt middle log, second process, kill loop | `cargo test -p kulyrax-cli --test file_store_crash` | 10 passed in 177 s; kill loop seed `1793341161776353201`, 29 kills, 26 mid-run, every iteration equal to the reference |
+| First run of the crash suite (batch 25) | same | 9 passed; the kill loop **failed its own check**: kill delays were drawn from a reference timed under contention, so almost every kill landed after the run had finished (every recovery still matched). Fixed: the loop learns the run time as it goes |
+| fmt, clippy `-D warnings` | `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| Whole workspace, before the first push | `cargo test --workspace --no-fail-fast` | 115 binaries, 373 passed, 0 failed (includes the crash suite) |
+
+## Risks and open questions
+
+- **The 2,000 events/s target may not be reachable on this laptop.** Every event
+  creates two files (data + guard). At ~370 µs per file created with 4–16 threads
+  (Defender not excluded), that alone caps a store at about 1,300 events/s. This
+  is a file-system cost, independent of the durability design.
+- Windows directory durability rests on NTFS journal ordering (assumed, not tested
+  with a power cut).
+- The kill loop and fault points test process crashes. A power loss is simulated
+  only by wiping the unsynced files, not by losing the page cache for real.
+
+## Outcome
+
+In progress.

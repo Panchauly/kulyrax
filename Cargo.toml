@@ -25,7 +25,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Kulyrax/kulyrax"
 authors = ["Kulyrax Contributors"]
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 kulyrax-core = { path = "crates/core", version = "0.10.0" }

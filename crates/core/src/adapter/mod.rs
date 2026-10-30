@@ -1,4 +1,5 @@
 pub mod document;
+pub mod file_store;
 pub mod graph;
 pub mod keyvalue;
 pub(crate) mod loader;

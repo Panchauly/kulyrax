@@ -1,9 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::{
+    adapter::file_store::{FileStore, FileTxn},
     adapter::keyvalue::adapter::KvError,
     adapter::keyvalue::exec::{self, KvBackend, KvGuard, KvOutcome, KvPlan},
     adapter::keyvalue::runtime::KvRuntimeBuilder,
@@ -16,11 +17,12 @@ use crate::{
 
 /// File-backed key-value store (Phase 14). Since Phase 22.1 the write path
 /// lives in [`exec::project`]; this file is the file-sidecar driver —
-/// behaviour is byte-identical to the pre-22.1 inlined version.
+/// Since Phase 3 (v0.11) every write goes through a [`FileStore`]: batched,
+/// logged, and crash-safe.
 pub struct FileKvStore {
     id: String,
     priority: u32,
-    root: PathBuf,
+    store: FileStore,
     builder: KvRuntimeBuilder,
     upcasters: Arc<UpcasterRegistry>,
     migration_policy: MigrationPolicy,
@@ -37,7 +39,7 @@ impl FileKvStore {
     ) -> Self {
         Self {
             id,
-            root,
+            store: FileStore::new(root),
             priority,
             builder,
             upcasters,
@@ -61,6 +63,22 @@ impl StorageAdapter for FileKvStore {
 
     fn priority(&self) -> u32 {
         self.priority
+    }
+
+    fn prepare(&self) -> Result<(), AdapterError> {
+        self.store.prepare()
+    }
+
+    fn begin_batch(&self, _events: &[&Event]) -> Result<(), AdapterError> {
+        self.store.begin()
+    }
+
+    fn commit_batch(&self) -> Result<(), AdapterError> {
+        self.store.commit()
+    }
+
+    fn rollback_batch(&self) {
+        self.store.rollback()
     }
 
     fn handle(&self, event: &Event) -> AdapterResult {
@@ -104,35 +122,37 @@ impl StorageAdapter for FileKvStore {
             facet: projection.facet,
         };
 
-        let mut backend = FileKvBackend { root: &self.root };
-
-        match exec::project(&mut backend, &plan, event) {
-            Ok(KvOutcome::Created) => AdapterResult::created_versioned(
+        let result = self
+            .store
+            .with_txn(|txn| exec::project(&mut FileKvBackend { txn }, &plan, event));
+        match result {
+            Ok(Ok(KvOutcome::Created)) => AdapterResult::created_versioned(
                 self.id.clone(),
                 StorageKind::KeyValue,
                 source_version,
                 projected_version,
             ),
-            Ok(KvOutcome::Updated) => AdapterResult::updated_versioned(
+            Ok(Ok(KvOutcome::Updated)) => AdapterResult::updated_versioned(
                 self.id.clone(),
                 StorageKind::KeyValue,
                 source_version,
                 projected_version,
             ),
-            Ok(KvOutcome::Deleted) => AdapterResult::deleted_versioned(
+            Ok(Ok(KvOutcome::Deleted)) => AdapterResult::deleted_versioned(
                 self.id.clone(),
                 StorageKind::KeyValue,
                 source_version,
                 projected_version,
             ),
-            Ok(KvOutcome::Skipped(reason)) => AdapterResult::skipped_versioned(
+            Ok(Ok(KvOutcome::Skipped(reason))) => AdapterResult::skipped_versioned(
                 self.id.clone(),
                 StorageKind::KeyValue,
                 reason,
                 source_version,
                 projected_version,
             ),
-            Err(e) => self.failure(AdapterError::WriteFailed(e.to_string())),
+            Ok(Err(e)) => self.failure(AdapterError::WriteFailed(e.to_string())),
+            Err(e) => self.failure(e),
         }
     }
 }
@@ -141,78 +161,59 @@ impl StorageAdapter for FileKvStore {
 // FileKvBackend — the driver
 // ---------------------------------------------------------------------------
 
-struct FileKvBackend<'a> {
-    root: &'a Path,
+struct FileKvBackend<'a, 't> {
+    txn: &'a mut FileTxn<'t>,
 }
 
-impl FileKvBackend<'_> {
-    /// Value path, keyed by `(namespace, key)` (Phase 14.2).
-    fn value_path(&self, namespace: &str, key: &str) -> PathBuf {
-        self.root.join(namespace).join(format!("{}.json", key))
-    }
+/// Value path, keyed by `(namespace, key)` (Phase 14.2).
+fn value_path(namespace: &str, key: &str) -> String {
+    format!("{namespace}/{key}.json")
+}
 
-    /// Idempotency guard path, keyed by `(namespace, key)`.
-    fn guard_path(&self, namespace: &str, key: &str) -> PathBuf {
-        self.root
-            .join(".conduit")
-            .join(namespace)
-            .join(format!("{}.guard.json", key))
-    }
+/// Idempotency guard path, keyed by `(namespace, key)`.
+fn guard_path(namespace: &str, key: &str) -> String {
+    format!(".conduit/{namespace}/{key}.guard.json")
+}
 
-    /// Commit the guard via write-to-temp-then-rename (Phase 11.3 pattern),
-    /// so a reader can never observe a partially-written guard file.
-    fn commit_guard(&self, guard: &Path, state: &KvGuard) -> std::io::Result<()> {
-        let parent = guard.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "idempotency guard path has no parent directory",
-            )
-        })?;
-        std::fs::create_dir_all(parent)?;
+fn write_err(e: std::io::Error) -> KvError {
+    KvError::WriteFailed(e.to_string())
+}
 
-        let tmp_name = format!(
-            ".{}.tmp-{}",
-            guard
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("guard"),
-            std::process::id()
-        );
-        let tmp = parent.join(tmp_name);
-        let content = serde_json::to_string(state)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, content)?;
-        std::fs::rename(&tmp, guard)
+impl FileKvBackend<'_, '_> {
+    fn write_guard(&mut self, namespace: &str, key: &str, state: &KvGuard) -> Result<(), KvError> {
+        let content =
+            serde_json::to_string(state).map_err(|e| KvError::WriteFailed(e.to_string()))?;
+        self.txn.write(&guard_path(namespace, key), content);
+        Ok(())
     }
 }
 
-impl KvBackend for FileKvBackend<'_> {
+impl KvBackend for FileKvBackend<'_, '_> {
     /// `Ok(None)` means this key has never been projected here; a corrupt
     /// sidecar is a write failure, not treated as absent (silently forgetting
     /// `last_sequence`/`deleted` would let a stale event through, or
     /// un-delete a tombstoned key).
     fn read_guard(&mut self, namespace: &str, key: &str) -> Result<Option<KvGuard>, KvError> {
-        let path = self.guard_path(namespace, key);
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
+        match self
+            .txn
+            .read(&guard_path(namespace, key))
+            .map_err(write_err)?
+        {
+            Some(content) => {
                 let parsed: KvGuard = serde_json::from_str(&content)
                     .map_err(|e| KvError::WriteFailed(format!("corrupt guard sidecar: {e}")))?;
                 Ok(Some(parsed))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(KvError::WriteFailed(e.to_string())),
+            None => Ok(None),
         }
     }
 
     fn read_value(&mut self, namespace: &str, key: &str) -> Result<Option<Value>, KvError> {
-        let path = self.value_path(namespace, key);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(
-                serde_json::from_str(&s).unwrap_or(Value::Object(Default::default())),
-            )),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(KvError::WriteFailed(e.to_string())),
-        }
+        Ok(self
+            .txn
+            .read(&value_path(namespace, key))
+            .map_err(write_err)?
+            .map(|s| serde_json::from_str(&s).unwrap_or(Value::Object(Default::default()))))
     }
 
     fn write(
@@ -223,30 +224,16 @@ impl KvBackend for FileKvBackend<'_> {
         guard: &KvGuard,
     ) -> Result<(), KvError> {
         if let Some(value) = value {
-            let value_path = self.value_path(namespace, key);
-            if let Some(parent) = value_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| KvError::WriteFailed(e.to_string()))?;
-            }
-            std::fs::write(
-                &value_path,
+            self.txn.write(
+                &value_path(namespace, key),
                 serde_json::to_string_pretty(value).unwrap_or_default(),
-            )
-            .map_err(|e| KvError::WriteFailed(e.to_string()))?;
+            );
         }
-        let guard_path = self.guard_path(namespace, key);
-        self.commit_guard(&guard_path, guard)
-            .map_err(|e| KvError::WriteFailed(e.to_string()))
+        self.write_guard(namespace, key, guard)
     }
 
     fn delete(&mut self, namespace: &str, key: &str, guard: &KvGuard) -> Result<(), KvError> {
-        let value_path = self.value_path(namespace, key);
-        match std::fs::remove_file(&value_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(KvError::WriteFailed(e.to_string())),
-        }
-        let guard_path = self.guard_path(namespace, key);
-        self.commit_guard(&guard_path, guard)
-            .map_err(|e| KvError::WriteFailed(e.to_string()))
+        self.txn.remove(&value_path(namespace, key));
+        self.write_guard(namespace, key, guard)
     }
 }

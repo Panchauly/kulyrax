@@ -1766,6 +1766,7 @@ dependencies = [
  "kulyrax-core",
  "kulyrax-ingest",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1784,6 +1785,7 @@ dependencies = [
 name = "kulyrax-core"
 version = "0.10.0"
 dependencies = [
+ "crc32fast",
  "once_cell",
  "rusqlite",
  "serde",

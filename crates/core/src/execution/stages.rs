@@ -42,6 +42,16 @@ pub enum Stage {
     Commit,
     /// `EventSource::commit`: advancing the source checkpoint.
     Checkpoint,
+    /// File stores, in `commit_batch`: writing the batch log and its fsync.
+    Log,
+    /// File stores, in `commit_batch`: writing the batch to the per-key
+    /// files, without fsync.
+    Apply,
+    /// File stores: sync points, which fsync the touched files and delete
+    /// the batch logs. They run on a background thread, beside dispatch, not
+    /// inside it; a `commit_batch` that has to wait for one counts the wait
+    /// here too.
+    Sync,
 }
 
 /// Call count and total time for one stage.
@@ -70,6 +80,9 @@ pub struct StageTimings {
     pub write: StageTotal,
     pub commit: StageTotal,
     pub checkpoint: StageTotal,
+    pub log: StageTotal,
+    pub apply: StageTotal,
+    pub sync: StageTotal,
 }
 
 impl StageTimings {
@@ -84,6 +97,9 @@ impl StageTimings {
             Stage::Write => &mut self.write,
             Stage::Commit => &mut self.commit,
             Stage::Checkpoint => &mut self.checkpoint,
+            Stage::Log => &mut self.log,
+            Stage::Apply => &mut self.apply,
+            Stage::Sync => &mut self.sync,
         }
     }
 }
@@ -99,6 +115,17 @@ pub fn timed<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
     let elapsed = start.elapsed();
     TIMINGS.with(|t| t.borrow_mut().slot(stage).add(elapsed));
     out
+}
+
+/// Add `calls` calls taking `elapsed` in total to `stage`, for work timed
+/// elsewhere (the file stores' background sync thread).
+pub fn record(stage: Stage, calls: u64, elapsed: Duration) {
+    TIMINGS.with(|t| {
+        let mut t = t.borrow_mut();
+        let slot = t.slot(stage);
+        slot.calls += calls;
+        slot.total_us += elapsed.as_micros() as u64;
+    });
 }
 
 /// Return this thread's totals and reset them to zero.

@@ -31,7 +31,7 @@ put `kulyrax` on your `PATH`. One binary, every backend included.
 Each archive has a `.sha256` file next to it. The binaries are not code-signed yet, so
 macOS and Windows will ask you to confirm the first run.
 
-**Or build from source** with Rust 1.88 or newer (no `protoc` install needed):
+**Or build from source** with Rust 1.89 or newer (no `protoc` install needed):
 
 ```sh
 cargo install --git https://github.com/Kulyrax/kulyrax kulyrax-cli
