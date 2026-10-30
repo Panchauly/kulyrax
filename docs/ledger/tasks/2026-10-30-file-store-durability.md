@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: blocked
 ---
 
 # Phase 3: crash-safe, batched file stores
@@ -45,10 +45,11 @@ binaries.
   replay from the checkpoint.
 - [ ] Benchmarks: 100k per file store, Defender excluded, batch 5,000, target
   ≥ 2,000 events/s on this laptop, per-stage numbers. Lag reruns at 1,000/s.
+  **Run, target not met:** 849–944 events/s; lag at 1,000/s grows without bound
+  (Verification). The 5,000/s Linux VM check is the owner's, later.
 - [x] Docs: file-store durability model (`docs/file-store-durability.md`).
-- [ ] Release notes for v0.11.0 (drafted, `RELEASES/v0.11.0.md`; benchmark numbers
-  pending).
-- [ ] Gates green before every push.
+- [x] Release notes for v0.11.0 (`RELEASES/v0.11.0.md`, with the measured numbers).
+- [x] Gates green before every push.
 
 ## Constraints and assumptions
 
@@ -61,8 +62,8 @@ binaries.
 - MSRV 1.88 → 1.89 for `File::try_lock` (decision record).
 - Owner's brief says "Defender excluded" for benchmarks. **The exclusion for
   `examples\benchmark\work` was removed on 2026-10-28 at 21:22** (Defender
-  operational log, event 5007). Adding it back needs admin; the owner was notified
-  on 2026-10-30.
+  operational log, event 5007). The owner added it back on 2026-10-30 at 18:05,
+  and the final benchmarks ran with it.
 
 ## Decisions
 
@@ -103,20 +104,22 @@ These set the sync delay (2 s) and explain the crash suite's run times.
 | Cheaper per-file flush on Windows | `fsbench`, 4,000 dirty files, 8 threads | `sync_all` 315 µs/file; `NtFlushBuffersFileEx(FLUSH_FLAGS_NO_SYNC)` 32 µs/file, then one device flush 48 ms |
 | Key-value throughput with the Windows `NO_SYNC` sync point (owner's choice), Defender on | `bash run.sh file-keyvalue 100000 1000` | **277** events/s, 100,000 verified. `sync` 845 ms per job (was 26.9 s), `log` 34 ms, `checkpoint` 59 ms per batch; `apply` now dominates at 17.7 s per 5,000-event batch (1.77 ms per file on 8 threads) |
 | Why `apply` doesn't scale: Defender | `fsbench`, 5,000 files in `examples/benchmark/work`, 1 / 8 threads | no extension 624 / 393 µs per file; `.json` 734 / **713**; `.done` 899 / 611. Defender's real-time scan serializes `.json` creation, so a store with Defender scanning its directory is bounded at a few hundred events/s whatever the design |
+| Defender exclusion restored by the owner | Defender operational log, event 5007 | `…\Exclusions\Paths\C:\Projects\kulyrax\examples\benchmark\work` added 2026-10-30 18:05:55 |
+| **Throughput, exclusion on** (the brief's setup), 100k events, batch 5,000, `b4673af` | `bash run.sh file-{document,keyvalue,graph} 100000 1000` → `results/file-*-phase3-excluded.txt` | document **944**, key-value **859**, graph **849** events/s (v0.10, excluded: 393 / 430 / 360). All 100,000 entities verified each time. **Fail** against ≥ 2,000 |
+| Where the time goes, exclusion on | same files, stage table | per 5,000-event batch: `apply` 5.0–5.7 s (~95%; 10,000 files, ~500 µs per file on 8 threads), `log` 27–54 ms, `checkpoint` 50–113 ms; `sync` 250–380 ms per job in the background. The durability overhead is ~3% of the batch; file creation is the bound |
+| **Lag at 1,000/s**, exclusion on, 180 s | `bash lag.sh file-{document,keyvalue,graph} 1000` → `results/file-*-lag-1000-phase3.txt` | every store falls behind: p50 30.0 / 29.8 / 29.8 s, p99 66.8 / 60.1 / 61.8 s, max 68.6 / 61.8 / 63.6 s (document / key-value / graph); all 180,000 events verified. **Fail** |
 | Whole workspace, before the first push | `cargo test --workspace --no-fail-fast` | 115 binaries, 373 passed, 0 failed (includes the crash suite) |
 
 ## Risks and open questions
 
-- **Throughput fails on this laptop, and is worse than v0.10 for the document
-  store** (60 vs 159 events/s, Defender on). The cause is per-file fsync at sync
-  points (Verification). The owner chose (2026-10-30) a Windows sync point that
-  writes each file with `FLUSH_FLAGS_NO_SYNC` and issues one device flush. Done: sync
-  is 30× cheaper. The bound is now creating `.json` files under Defender's
-  real-time scan (~700 µs per file, no gain from threads). **Blocked:** a
-  meaningful number needs the Defender exclusion for `examples\benchmark\work` back
-  (admin only), as the brief specifies.
-- Lag at 1,000/s was not run: at ~230 events/s of capacity, a 1,000/s stream falls
-  behind without bound, so the result is known (fail).
+- **Throughput misses 2,000 events/s on this laptop** (849–944 with the exclusion,
+  2.0–2.4× v0.10), and lag at 1,000/s fails. The durability path costs ~3% of a
+  batch; the rest is creating two files per event. Reaching the target here would
+  need a different on-disk layout (fewer files per event), which is a product
+  change outside this phase (decision record, option 3). **Owner's call:** accept
+  the measured numbers for v0.11, or hold the release for the Linux VM check.
+- With Defender scanning the store directory, throughput drops to 230–280
+  events/s (Defender serializes `.json` creation). The release notes say so.
 - The v0.10 Defender-on result files `results/file-{document,keyvalue,graph}.txt`
   were overwritten by this phase's runs (`results/` is gitignored, local only). Their
   headline numbers survive in
@@ -133,4 +136,7 @@ These set the sync delay (2 s) and explain the crash suite's run times.
 
 ## Outcome
 
-In progress.
+Blocked on the owner: every criterion is met except the throughput target
+(≥ 2,000 events/s, and lag at 1,000/s), which this laptop's file-creation cost
+rules out for the current on-disk layout. Crash safety is complete and tested. The
+owner decides whether v0.11 ships with the measured numbers.
