@@ -101,16 +101,20 @@ These set the sync delay (2 s) and explain the crash suite's run times.
 | Throughput, Defender **on** (exclusion missing), 100k events, batch 5,000, `e6f6202` | `bash run.sh file-{document,keyvalue,graph} 100000 1000` | document **60**, key-value **232**, graph **234** events/s (v0.10, Defender on: 159 / 218 / 143). All 100,000 entities verified each time. **Fail** against ≥ 2,000 |
 | Where the time goes (key-value; the others are alike) | stage table, `results/file-*-phase3-defender-on.txt` | `apply` 20.5 s per 5,000-event batch; `sync` 26.9 s per job, in the background at the same time; `log` 131 ms and `checkpoint` 86 ms per batch. Under sustained load the OS does not write the files back within the 2 s delay, so each per-file fsync is a device cache flush (~2 ms per file). Those flushes stall `apply`, and the sync queue's back-pressure throttles commits to the per-file fsync rate |
 | Cheaper per-file flush on Windows | `fsbench`, 4,000 dirty files, 8 threads | `sync_all` 315 µs/file; `NtFlushBuffersFileEx(FLUSH_FLAGS_NO_SYNC)` 32 µs/file, then one device flush 48 ms |
+| Key-value throughput with the Windows `NO_SYNC` sync point (owner's choice), Defender on | `bash run.sh file-keyvalue 100000 1000` | **277** events/s, 100,000 verified. `sync` 845 ms per job (was 26.9 s), `log` 34 ms, `checkpoint` 59 ms per batch; `apply` now dominates at 17.7 s per 5,000-event batch (1.77 ms per file on 8 threads) |
+| Why `apply` doesn't scale: Defender | `fsbench`, 5,000 files in `examples/benchmark/work`, 1 / 8 threads | no extension 624 / 393 µs per file; `.json` 734 / **713**; `.done` 899 / 611. Defender's real-time scan serializes `.json` creation, so a store with Defender scanning its directory is bounded at a few hundred events/s whatever the design |
 | Whole workspace, before the first push | `cargo test --workspace --no-fail-fast` | 115 binaries, 373 passed, 0 failed (includes the crash suite) |
 
 ## Risks and open questions
 
 - **Throughput fails on this laptop, and is worse than v0.10 for the document
   store** (60 vs 159 events/s, Defender on). The cause is per-file fsync at sync
-  points (Verification). Owner's decision pending: a Windows sync point that writes
-  each file with `FLUSH_FLAGS_NO_SYNC` and issues one device flush (10× cheaper
-  measured; needs `unsafe` FFI to `ntdll` in `kulyrax-core`), or keep per-file fsync
-  and confirm on the Linux VM.
+  points (Verification). The owner chose (2026-10-30) a Windows sync point that
+  writes each file with `FLUSH_FLAGS_NO_SYNC` and issues one device flush. Done: sync
+  is 30× cheaper. The bound is now creating `.json` files under Defender's
+  real-time scan (~700 µs per file, no gain from threads). **Blocked:** a
+  meaningful number needs the Defender exclusion for `examples\benchmark\work` back
+  (admin only), as the brief specifies.
 - Lag at 1,000/s was not run: at ~230 events/s of capacity, a 1,000/s stream falls
   behind without bound, so the result is known (fail).
 - The v0.10 Defender-on result files `results/file-{document,keyvalue,graph}.txt`

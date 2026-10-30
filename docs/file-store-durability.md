@@ -80,7 +80,11 @@ root directory, as before: their files never overlap.
 
 - **Linux, macOS:** directories are fsynced after a log rename, after a checkpoint
   rename, and at each sync point, so new and removed file names are durable too.
-- **Windows:** a directory cannot be fsynced with the standard library, so that step
+- **Windows, sync points:** `FlushFileBuffers` asks the disk to flush its whole cache
+  for every file, which costs milliseconds each. So a sync point writes each file to
+  the disk without that flush (`NtFlushBuffersFileEx`, `FLUSH_FLAGS_NO_SYNC`), then
+  flushes the disk's cache once, before it deletes any log.
+- **Windows, directories:** a directory cannot be fsynced with the standard library, so that step
   is a no-op. Kulyrax relies on NTFS journaling its metadata changes (creates,
   renames) in order: if a checkpoint's rename survived, so did the earlier batch
   log's rename. This is the documented behaviour of NTFS's log but has not been

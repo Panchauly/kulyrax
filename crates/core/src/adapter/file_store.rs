@@ -247,12 +247,82 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Fsync one file if it still exists (a later batch may have removed it).
+/// Make one file's data and metadata durable for a sync point, if it still
+/// exists (a later batch may have removed it).
+///
+/// Unix: `fsync`. Windows: the file is written to the device without the
+/// device cache flush that `FlushFileBuffers` sends for every file;
+/// [`run_sync`] sends one for all of them afterwards. Measured on NTFS, 4,000
+/// dirty files on 8 threads: 315 µs per file with `FlushFileBuffers`, 32 µs
+/// with the flush deferred, plus 48 ms once.
 fn sync_file(path: &Path) -> io::Result<()> {
     match OpenOptions::new().write(true).open(path) {
+        #[cfg(windows)]
+        Ok(f) => windows::flush_without_device_sync(&f),
+        #[cfg(not(windows))]
         Ok(f) => f.sync_all(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    /// `IO_STATUS_BLOCK`: a status/pointer union, then a `ULONG_PTR`.
+    #[repr(C)]
+    struct IoStatusBlock {
+        status: usize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtFlushBuffersFileEx(
+            file: *mut c_void,
+            flags: u32,
+            parameters: *const c_void,
+            parameters_size: u32,
+            io_status: *mut IoStatusBlock,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+
+    /// Write the file's data and metadata to the storage device, but do not
+    /// ask the device to flush its own cache.
+    const FLUSH_FLAGS_NO_SYNC: u32 = 0x2;
+
+    /// `NtFlushBuffersFileEx(FLUSH_FLAGS_NO_SYNC)`. The result is durable only
+    /// after a device cache flush, which any `FlushFileBuffers` on the same
+    /// volume sends.
+    pub(super) fn flush_without_device_sync(file: &File) -> io::Result<()> {
+        let mut io_status = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        // SAFETY: the handle is a valid open file handle borrowed from `file`
+        // for the duration of the call; no parameters are passed (null, 0);
+        // `io_status` is a live, correctly laid out IO_STATUS_BLOCK.
+        let status = unsafe {
+            NtFlushBuffersFileEx(
+                file.as_raw_handle(),
+                FLUSH_FLAGS_NO_SYNC,
+                std::ptr::null(),
+                0,
+                &mut io_status,
+            )
+        };
+        if status >= 0 {
+            Ok(())
+        } else {
+            // SAFETY: a pure status-code translation with no pointers.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            Err(io::Error::from_raw_os_error(code as i32))
+        }
     }
 }
 
@@ -545,6 +615,14 @@ impl Root {
 fn run_sync(root: &Path, job: &SyncJob) -> io::Result<()> {
     crash_point("before-sync");
     for_each_parallel(&job.files, |f| sync_file(&root.join(f)))?;
+    // Windows: `sync_file` deferred the device cache flush. One
+    // `FlushFileBuffers` sends it for the whole volume, so every file above
+    // is durable before any log is deleted. NTFS sends it even for a file
+    // with nothing left to write (measured: 48 ms on a clean file).
+    #[cfg(windows)]
+    if let Some(newest) = job.logs.last() {
+        OpenOptions::new().write(true).open(newest)?.sync_all()?;
+    }
     if cfg!(unix) {
         let dirs: Vec<String> = dirs_to_sync(&job.files).into_iter().collect();
         for_each_parallel(&dirs, |d| sync_dir(&root.join(d)))?;
@@ -642,9 +720,13 @@ fn recover(root: &Root, known_dirs: &mut HashSet<String>) -> io::Result<u64> {
     let logs = list_logs(&root.wal_dir())?;
     let next_seq = logs.last().map_or(1, |(seq, _)| seq + 1);
     let mut decoded = Vec::with_capacity(logs.len());
+    let mut valid = Vec::with_capacity(logs.len());
     for (i, (_, path)) in logs.iter().enumerate() {
         match decode_log(&fs::read(path)?) {
-            Some(p) => decoded.push(p),
+            Some(p) => {
+                decoded.push(p);
+                valid.push(path.clone());
+            }
             // The newest log torn: its batch never finished committing, so
             // the source checkpoint never moved past it. Its events are read
             // again from the source.
@@ -669,7 +751,7 @@ fn recover(root: &Root, known_dirs: &mut HashSet<String>) -> io::Result<u64> {
     if !decoded.is_empty() {
         let job = SyncJob {
             files: touched.into_iter().collect(),
-            logs: logs.into_iter().map(|(_, p)| p).collect(),
+            logs: valid,
             not_before: None,
         };
         run_sync(&root.dir, &job)?;

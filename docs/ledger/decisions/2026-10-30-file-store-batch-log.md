@@ -100,7 +100,17 @@ it was written) and the logs written since then go to a background thread. It fi
 waits until the job is 2 s old (`SYNC_DELAY`): by then the OS has written most of the
 files back, and their fsyncs are cheap (Context). Then it fsyncs each file that still
 exists, then each touched directory (Unix only), then deletes the logs oldest first.
-Up to 4 jobs wait in the queue. A commit that finds the queue full blocks until it
+On Windows a file's flush skips the device cache flush
+(`NtFlushBuffersFileEx` with `FLUSH_FLAGS_NO_SYNC`), and one `FlushFileBuffers`
+on the job's newest log then flushes the device cache for all of them, before any
+log is deleted. Under load the 2 s delay was not enough: the OS had not written the
+files back yet, so every per-file `FlushFileBuffers` was a device cache flush. The
+sync point then ran at ~2 ms per file and throttled the whole store (task,
+Verification). The owner chose this fix over keeping per-file fsync (2026-10-30). It
+is the one `unsafe` block in `kulyrax-core`: an FFI call to `ntdll`, Windows only.
+It assumes NTFS writes the file's metadata to the device on a `NO_SYNC` flush and
+sends a device cache flush on every `FlushFileBuffers`, even for a clean file
+(measured: 48 ms). Up to 4 jobs wait in the queue. A commit that finds the queue full blocks until it
 can queue its own (back-pressure, so the logs on disk stay bounded). A store that is
 dropped cleanly skips the wait, runs a last sync and waits for it.
 
@@ -172,6 +182,9 @@ aborts the process the n-th time it reaches `after-log`, `mid-apply`,
 - A fresh-store rebuild still writes and fsyncs every file once: the dedup only helps
   hot keys. This laptop's file-creation cost bounds file-store throughput regardless
   of this design (task, Verification).
+
+- An `unsafe` FFI block in `kulyrax-core` (Windows only) for the deferred device
+  flush.
 
 ## Revisit if
 
